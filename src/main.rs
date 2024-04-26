@@ -7,47 +7,68 @@ use tokio::sync::mpsc;
 
 use crate::heaters::HeaterAction;
 
-pub trait DeviceActionTrait: Send + AsAny {}
+pub trait DeviceTrait {
+    type Action: DeviceActionTrait;
 
-async fn receiver_loop(mut receiver: mpsc::Receiver<Box<dyn DeviceActionTrait>>) {
-    let mut heater = HeatersController { power: false };
+    fn handle_action(&mut self, action: &Self::Action) -> <Self::Action as DeviceActionTrait>::Result;
+}
 
-    while let Some(message) = receiver.recv().await {
-        if let Some(message) = message.deref().downcast_ref::<HeaterAction>() {
-            match message {
-                HeaterAction::SetStatus(status) => {
-                    heater.power = *status;
-                    println!("Heater power set to: {}", heater.power);
-                }
-                HeaterAction::GetStatus => {
-                    println!("Heater power is: {}", heater.power);
-                }
-            }
+pub trait DeviceActionTrait: Send + AsAny {
+    type Result: DeviceActionResultTrait;
+}
+
+pub trait DeviceActionWrapperTrait: Send + AsAny {}
+impl<T: DeviceActionTrait> DeviceActionWrapperTrait for T {}
+
+pub trait DeviceActionResultTrait: Send + AsAny {}
+
+async fn receiver_loop<D: DeviceTrait>(
+    device: &mut D,
+    mut q_receiver: mpsc::Receiver<Box<dyn DeviceActionWrapperTrait>>,
+    r_sender: mpsc::Sender<Box<dyn DeviceActionResultTrait>>,
+) {
+    while let Some(message) = q_receiver.recv().await {
+        if let Some(action) = message.deref().downcast_ref::<D::Action>() {
+            let result = device.handle_action(action);
+            r_sender.send(Box::new(result)).await.unwrap();
         }
     }
 }
 
-async fn sender_loop(sender: mpsc::Sender<Box<dyn DeviceActionTrait>>) {
-    let a1 = HeaterAction::GetStatus;
-    let a2 = HeaterAction::SetStatus(true);
+async fn sender_loop<A: DeviceActionTrait>(
+    q_sender: mpsc::Sender<Box<dyn DeviceActionWrapperTrait>>,
+    mut r_receiver: mpsc::Receiver<Box<dyn DeviceActionResultTrait>>,
+    actions: Vec<A>,
+) {
+    for action in actions {
+        q_sender.send(Box::new(action)).await.unwrap();
+    }
 
-    let vec: Vec<Box<dyn DeviceActionTrait>> = vec![Box::new(a1), Box::new(a2)];
-
-    for action in vec {
-        sender.send(action).await.unwrap();
+    while let Some(result) = r_receiver.recv().await {
+        if let Some(result) = result.deref().downcast_ref::<heaters::HeaterResult>() {
+            println!("RESULT Heater power is: {}", result.power);
+        }
     }
 }
 
 #[tokio::main]
 async fn main() {
-    let (sender, receiver) = mpsc::channel(10);
+    let (q_sender, q_receiver) = mpsc::channel(10);
+    let (r_sender, r_receiver) = mpsc::channel(10);
+
+    let actions = vec![
+        HeaterAction::GetStatus,
+        HeaterAction::SetStatus(true)
+    ];
 
     let h1 = tokio::spawn(async move {
-        sender_loop(sender).await;
+        sender_loop(q_sender, r_receiver, actions).await;
     });
 
+    let mut heater = HeatersController { power: false };
+
     let h2 = tokio::spawn(async move {
-        receiver_loop(receiver).await;
+        receiver_loop(&mut heater, q_receiver, r_sender).await;
     });
 
     h1.await.unwrap();
